@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Push the verified image to Harbor
+        type: boolean
+        default: true
+
 
 permissions:
   contents: write
@@ -17,6 +23,9 @@ jobs:
     if: github.repository == 'MetroYYY/logto'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    outputs:
+      revision: ${{ steps.result.outputs.revision }}
+      changed: ${{ steps.prepare.outputs.changed }}
     env:
       CI: 'true'
       TARGET: packages/experience/src/shared/components/LogtoSignature/index.tsx
@@ -143,3 +152,103 @@ jobs:
             exit 1
           fi
           echo 'Synced upstream and committed the guard removal to master. No deployment was performed.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record the exact patched commit
+        id: result
+        shell: bash
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  docker:
+    name: Build and publish Logto to Harbor
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      REGISTRY: registry.hsiyue.com
+      IMAGE: registry.hsiyue.com/logto/logto
+      REVISION: ${{ needs.sync.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.revision }}
+          persist-credentials: false
+
+      - name: Verify patched source before building
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REVISION"
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('packages/experience/src/shared/components/LogtoSignature/index.tsx').read_text()
+          for marker in ('MutationObserver', 'enforceIntegrity', 'signatureGuardStyle', 'guardStyleSelector', 'containerRef', 'anchorRef', '!important'):
+              if marker in source:
+                  raise SystemExit('Signature guard remains: ' + marker)
+          assert 'data-logto-signature-container' in source
+          assert 'Powered by' in source
+          PY
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build the official Dockerfile with patched source
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:sha-${{ env.REVISION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/MetroYYY/logto
+            org.opencontainers.image.revision=${{ env.REVISION }}
+          cache-from: type=gha,scope=logto-amd64
+          cache-to: type=gha,mode=max,scope=logto-amd64
+
+      - name: Check image contents and Node runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint node "$IMAGE:sha-$REVISION" --version
+          docker run --rm --entrypoint sh "$IMAGE:sha-$REVISION" -ec 'test -f packages/core/build/index.js; test -d packages/experience/dist; test -d packages/console/dist'
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE:sha-$REVISION")" = "$REVISION"
+
+      - name: Check publishing credentials
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        shell: bash
+        run: |
+          test -n "$HARBOR_USERNAME" && test -n "$HARBOR_PASSWORD" || { echo '::error::Configure HARBOR_USERNAME and HARBOR_PASSWORD repository secrets.'; exit 1; }
+
+      - name: Log in to Harbor
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Push and verify the published digest
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE:sha-$REVISION"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:sha-$REVISION")
+          test -n "$digest"
+          docker buildx imagetools inspect "$digest"
+          docker tag "$IMAGE:sha-$REVISION" "$IMAGE:master"
+          docker push "$IMAGE:master"
+          {
+            echo '## Published Logto image'
+            echo "Source commit: $REVISION"
+            echo "Commit tag: $IMAGE:sha-$REVISION"
+            echo "Moving tag: $IMAGE:master"
+            echo "Pinned image: $digest"
+            echo 'Platform: linux/amd64. No cluster deployment was performed.'
+          } >> "$GITHUB_STEP_SUMMARY"

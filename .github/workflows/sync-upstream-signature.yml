@@ -1,0 +1,145 @@
+name: Sync upstream and remove signature guard
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-signature-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'MetroYYY/logto'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CI: 'true'
+      TARGET: packages/experience/src/shared/components/LogtoSignature/index.tsx
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Prepare verified patch and merge upstream
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/logto-io/logto.git
+          git fetch --no-tags upstream master
+          python3 - <<'PY'
+          import hashlib, os, pathlib, subprocess
+          target = os.environ['TARGET']
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True)
+          def patch(source):
+              source = source.replace('\r\n', '\n')
+              # Only remove reviewed guard blocks. Unknown upstream changes stop the job.
+              a = source.index('const guardStyleSelector =')
+              b = source.index('type Props =', a)
+              c = source.index('  const containerRef =')
+              d = source.index('\n  return (', c)
+              for block, expected in [
+                  (source[a:b], 'ece097d64ae126d2fea16639bbc9556f911f7d4d001e90718b22274fc08982c3'),
+                  (source[c:d], '288bbf2e5a4e397a631b1fae5079a7077a214291a8fa8df50ad006d843711687'),
+              ]:
+                  if hashlib.sha256(block.encode()).hexdigest() != expected:
+                      raise RuntimeError('Upstream guard changed; review the patch before syncing.')
+              result = source[:a] + source[b:c] + source[d:]
+              for old, new in [
+                  ("import { useEffect, useRef } from 'react';\n", ''),
+                  ('ref={containerRef} ', ''),
+                  ('        ref={anchorRef}\n', ''),
+              ]:
+                  if result.count(old) != 1:
+                      raise RuntimeError('Unexpected component structure: ' + old)
+                  result = result.replace(old, new, 1)
+              for word in ['MutationObserver', 'setInterval', 'useEffect', 'useRef',
+                           'enforceIntegrity', 'signatureGuardStyle', 'guardStyleSelector',
+                           'containerRef', 'anchorRef', '!important']:
+                  if word in result:
+                      raise RuntimeError('Guard residue: ' + word)
+              if 'data-logto-signature-container' not in result or 'Powered by' not in result:
+                  raise RuntimeError('Visible signature markup must be preserved.')
+              return result
+          upstream = git('show', 'upstream/master:' + target)
+          desired = patch(upstream)
+          # Regression checks: exact deterministic result and fail closed on changed guard.
+          assert patch(upstream) == desired
+          try:
+              patch(upstream.replace('enforceIntegrity, 2000', 'enforceIntegrity, 3000'))
+          except (ValueError, RuntimeError):
+              pass
+          else:
+              raise RuntimeError('Changed-guard rejection test failed')
+          base = git('merge-base', 'HEAD', 'upstream/master').strip()
+          original = git('show', base + ':' + target)
+          current = pathlib.Path(target).read_text()
+          if current not in (original, patch(original)):
+              raise RuntimeError('Local signature edits detected; refusing to overwrite them.')
+          # Do not merge changes to this automation itself without a review.
+          workflow = '.github/workflows/sync-upstream-signature.yml'
+          if workflow in git('diff', '--name-only', base, 'upstream/master').splitlines():
+              raise RuntimeError('Upstream changed the fork automation path; review required.')
+          merged = subprocess.run(['git', 'merge', '--no-commit', '--no-ff', 'upstream/master'])
+          if merged.returncode:
+              conflicts = git('diff', '--name-only', '--diff-filter=U').splitlines()
+              if conflicts != [target]:
+                  raise RuntimeError('Merge conflict outside the signature: ' + repr(conflicts))
+          pathlib.Path(target).write_text(desired)
+          subprocess.run(['git', 'add', '--', target], check=True)
+          if git('diff', '--name-only', '--diff-filter=U').strip():
+              raise RuntimeError('Unresolved merge conflict')
+          # Other future signature files must not introduce another guard unnoticed.
+          for p in pathlib.Path(target).parent.rglob('*'):
+              if p.suffix in ('.ts', '.tsx', '.scss') and p.name != 'index.tsx' and '.test.' not in p.name:
+                  text = p.read_text()
+                  if any(x in text for x in ['MutationObserver', 'enforceIntegrity', '!important']):
+                      raise RuntimeError('Review possible guard in ' + str(p))
+          changed = bool(git('diff', '--cached', '--name-only').strip()) or pathlib.Path('.git/MERGE_HEAD').exists()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('changed=' + str(changed).lower() + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('Upstream commit: `' + git('rev-parse', 'upstream/master').strip() + '`\n\n')
+              f.write('Guard patch checks passed. Pending changes: ' + str(changed) + '\n')
+          PY
+
+      - uses: actions/setup-node@v4
+        if: steps.prepare.outputs.changed == 'true'
+        with:
+          node-version: '22.23.4'
+
+      - name: Install dependencies and build affected frontend
+        if: steps.prepare.outputs.changed == 'true'
+        shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: |
+          set -euo pipefail
+          npm install --global pnpm@10.33.2
+          pnpm install --frozen-lockfile
+          pnpm --filter '@logto/experience...' --workspace-concurrency=2 run build
+          git diff --exit-code -- "$TARGET"
+
+      - name: Commit and push verified changes
+        if: steps.prepare.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --cached --check
+          git commit -m "chore: sync upstream and allow custom signature CSS"
+          # Normal push only: concurrent user commits cause a safe failure, never a force push.
+          if ! git push origin HEAD:master; then
+            echo '::error::Push rejected. Check concurrent commits/branch rules. If upstream changed workflow files, Sync fork manually or configure UPSTREAM_SYNC_TOKEN with Contents and Workflows write permissions, then run this workflow again.'
+            exit 1
+          fi
+          echo 'Synced upstream and committed the guard removal to master. No deployment was performed.' >> "$GITHUB_STEP_SUMMARY"
